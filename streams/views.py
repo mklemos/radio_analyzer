@@ -1,5 +1,6 @@
 from django.shortcuts import render
-from .models import RadioStation
+from django.http import JsonResponse
+from .models import RadioStation, Transcription
 from .utils.stream_manager import StreamManager
 
 stream_manager = StreamManager()
@@ -14,3 +15,8 @@ def index(request):
 
 def dashboard(request):
     return render(request, 'streams/dashboard.html')
+
+def get_transcriptions(request):
+    transcriptions = Transcription.objects.all().order_by('-timestamp')
+    data = [{'station': t.station.name, 'timestamp': t.timestamp, 'text': t.text} for t in transcriptions]
+    return JsonResponse(data, safe=False)

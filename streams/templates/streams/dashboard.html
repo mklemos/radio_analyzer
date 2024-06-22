@@ -3,10 +3,31 @@
 <html>
 <head>
     <title>Dashboard - Radio Stream Analyzer</title>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script>
+        $(document).ready(function() {
+            function fetchTranscriptions() {
+                $.ajax({
+                    url: "{% url 'get_transcriptions' %}",
+                    method: "GET",
+                    success: function(data) {
+                        $('#transcriptions').empty();
+                        data.forEach(function(transcription) {
+                            $('#transcriptions').append('<p><strong>' + transcription.station + '</strong> (' + transcription.timestamp + '): ' + transcription.text + '</p>');
+                        });
+                    }
+                });
+            }
+
+            setInterval(fetchTranscriptions, 5000);  // Fetch transcriptions every 5 seconds
+        });
+    </script>
 </head>
 <body>
     <h1>Dashboard</h1>
-    <p>Here you will see the real-time analysis of radio streams.</p>
+    <div id="transcriptions">
+        <!-- Transcriptions will be dynamically inserted here -->
+    </div>
     <a href="{% url 'index' %}">Back to Home</a>
 </body>
 </html>

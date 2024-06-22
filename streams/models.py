@@ -6,3 +6,11 @@ class RadioStation(models.Model):
 
     def __str__(self):
         return self.name
+
+class Transcription(models.Model):
+    station = models.ForeignKey(RadioStation, on_delete=models.CASCADE)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    text = models.TextField()
+
+    def __str__(self):
+        return f"{self.station.name} - {self.timestamp}"
