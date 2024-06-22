@@ -8,3 +8,5 @@ class Transcription(models.Model):
     station = models.ForeignKey(RadioStation, on_delete=models.CASCADE)
     timestamp = models.DateTimeField(auto_now_add=True)
     text = models.TextField()
+    summary = models.TextField(default='')  # Added summary field with a default value
+

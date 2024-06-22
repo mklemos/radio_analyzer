@@ -7,16 +7,21 @@ from io import BytesIO
 import os
 import uuid
 import time
+from collections import defaultdict
 from streams.models import RadioStation, Transcription
+from .text_summarizer import summarize_text
+from .topic_segmenter import segment_topics
 
 RIFF_HEADER = b'RIFF'
 
 class StreamManager:
     def __init__(self):
         self.streams = {}
-        self.transcription_cache = {}
+        self.transcription_cache = defaultdict(list)
+        self.lock = threading.Lock()
         self.cleanup_interval = 60  # Cleanup temp files every 60 seconds
         self.start_cleanup_thread()
+        self.start_persistence_thread()
 
     def add_stream(self, name, url):
         if name not in self.streams:
@@ -42,7 +47,7 @@ class StreamManager:
             retcode = process.poll()
             if retcode is not None:
                 process.terminate()
-                time.sleep(5)  # Short delay before restarting the stream process
+                time.sleep(1)  # Short delay before restarting the stream process
                 continue
 
             try:
@@ -50,7 +55,7 @@ class StreamManager:
             except Exception as e:
                 print(f"Error processing audio chunk for {name}: {e}")
                 process.terminate()
-                time.sleep(5)  # Short delay before restarting the stream process
+                time.sleep(1)  # Short delay before restarting the stream process
                 continue
 
     def handle_audio_chunk(self, name, audio_stream):
@@ -83,13 +88,36 @@ class StreamManager:
                     text = recognizer.recognize_google(audio)
                     print(f"Transcribed text for {name}: {text}")
 
-                    if name not in self.transcription_cache:
-                        self.transcription_cache[name] = []
-                    if text not in self.transcription_cache[name]:
-                        Transcription.objects.create(station=RadioStation.objects.get(name=name), text=text)
-                        self.transcription_cache[name].append(text)
-                        if len(self.transcription_cache[name]) > 10:
-                            self.transcription_cache[name].pop(0)
+                    if not text.strip():
+                        print(f"No text transcribed for {name}. Skipping summarization and topic segmentation.")
+                        return
+
+                    # Adjust max_length for summarization
+                    input_length = len(text.split())
+                    max_length = min(150, max(10, input_length // 2))
+
+                    # Summarize the text
+                    summary = summarize_text(text, max_length=max_length)
+                    print(f"Summary for {name}: {summary}")
+
+                    with self.lock:
+                        if text not in self.transcription_cache[name]:
+                            Transcription.objects.create(
+                                station=RadioStation.objects.get(name=name),
+                                text=text,
+                                summary=summary
+                            )
+                            self.transcription_cache[name].append(text)
+                            if len(self.transcription_cache[name]) > 10:
+                                self.transcription_cache[name].pop(0)
+
+                        # Segment topics
+                        texts = self.transcription_cache[name]
+                        if len(texts) >= 5:  # Ensure there are enough samples for clustering
+                            clusters, terms = segment_topics(texts, n_clusters=min(5, len(texts)))
+                            print(f"Topics for {name}: {clusters}")
+                            print(f"Terms for {name}: {terms}")
+
                 except sr.UnknownValueError:
                     print(f"Could not understand audio from {name}")
                 except sr.RequestError as e:
@@ -109,6 +137,23 @@ class StreamManager:
         cleanup_thread.daemon = True  # Ensure the thread exits when the main program does
         cleanup_thread.start()
 
+    def start_persistence_thread(self):
+        persistence_thread = threading.Thread(target=self.persist_data)
+        persistence_thread.daemon = True  # Ensure the thread exits when the main program does
+        persistence_thread.start()
+
+    def persist_data(self):
+        while True:
+            with self.lock:
+                # Code to persist data to the database or file
+                pass
+            time.sleep(self.cleanup_interval)
+
+    def cleanup_temp_files_periodically(self):
+        while True:
+            self.cleanup_tmp_files()
+            time.sleep(self.cleanup_interval)
+
     def cleanup_tmp_files(self):
         print("Cleaning up temp files...")
         tmp_files = [f for f in os.listdir('/tmp') if f.endswith('.wav')]
@@ -119,11 +164,6 @@ class StreamManager:
                 print(f"Deleted temporary file: {file_path}")
             except Exception as e:
                 print(f"Error deleting file {file_path}: {e}")
-
-    def cleanup_temp_files_periodically(self):
-        while True:
-            self.cleanup_tmp_files()
-            time.sleep(self.cleanup_interval)
 
 # Start StreamManager and add a stream
 if __name__ == "__main__":
