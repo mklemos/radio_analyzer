@@ -1,0 +1,20 @@
+<!-- index.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Radio Stream Analyzer</title>
+</head>
+<body>
+    <h1>Welcome to the Radio Stream Analyzer</h1>
+    <form method="post">
+        {% csrf_token %}
+        <select name="station_id">
+            {% for station in stations %}
+                <option value="{{ station.id }}">{{ station.name }}</option>
+            {% endfor %}
+        </select>
+        <button type="submit">Start Stream</button>
+    </form>
+    <a href="{% url 'dashboard' %}">Go to Dashboard</a>
+</body>
+</html>
