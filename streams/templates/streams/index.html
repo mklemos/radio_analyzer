@@ -1,11 +1,10 @@
-<!-- index.html -->
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Radio Stream Analyzer</title>
+    <title>Radio Streams</title>
 </head>
 <body>
-    <h1>Welcome to the Radio Stream Analyzer</h1>
+    <h1>Available Radio Stations</h1>
     <form method="post">
         {% csrf_token %}
         <select name="station_id">
@@ -15,6 +14,5 @@
         </select>
         <button type="submit">Start Stream</button>
     </form>
-    <a href="{% url 'dashboard' %}">Go to Dashboard</a>
 </body>
 </html>
