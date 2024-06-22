@@ -19,24 +19,25 @@ class StreamManager:
         print(f"Processing stream for {name} from {url}")
         response = requests.get(url, stream=True)
         audio_data = BytesIO()
-        for chunk in response.iter_content(chunk_size=1024):
-            if chunk:
-                audio_data.write(chunk)
-                self.handle_audio_chunk(name, audio_data.getvalue())
-                audio_data.seek(0)
-                audio_data.truncate()
-
-    def handle_audio_chunk(self, name, chunk):
-        # Convert raw audio chunk to AudioSegment
-        audio_segment = AudioSegment.from_raw(BytesIO(chunk), sample_width=2, frame_rate=44100, channels=1)
-        
-        # Save to a temporary file for speech recognition
-        audio_file = BytesIO()
-        audio_segment.export(audio_file, format='wav')
-        audio_file.seek(0)
-        
-        # Recognize the audio
         recognizer = sr.Recognizer()
+        chunk_size = 1024
+        buffer_size = chunk_size * 10  # Adjust buffer size as needed
+        buffer = BytesIO()
+
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            if chunk:
+                buffer.write(chunk)
+                if buffer.tell() >= buffer_size:
+                    buffer.seek(0)
+                    audio_segment = AudioSegment.from_raw(buffer, sample_width=2, frame_rate=44100, channels=1)
+                    audio_file = BytesIO()
+                    audio_segment.export(audio_file, format='wav')
+                    audio_file.seek(0)
+                    self.handle_audio_chunk(name, audio_file, recognizer)
+                    buffer.seek(0)
+                    buffer.truncate()
+
+    def handle_audio_chunk(self, name, audio_file, recognizer):
         with sr.AudioFile(audio_file) as source:
             audio = recognizer.record(source)
             try:
