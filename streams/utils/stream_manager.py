@@ -7,14 +7,17 @@ from io import BytesIO
 import os
 import uuid
 import time
+import collections
+from datetime import datetime
 from collections import defaultdict
-from streams.models import RadioStation, Transcription
+from streams.models import RadioStation, Transcription, Segment
 from transformers import pipeline
 import re
 import logging
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from itertools import groupby
+from django.utils import timezone
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +27,82 @@ logger = logging.getLogger(__name__)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 RIFF_HEADER = b'RIFF'
+
+class SmartSummarizer:
+    def __init__(self, similarity_threshold=0.7, summary_word_threshold=30):
+        self.similarity_threshold = similarity_threshold
+        self.summary_word_threshold = summary_word_threshold
+        self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        self.summary_history = []
+
+    def clean_text(self, text):
+        # Remove filler words and phrases
+        filler_words = ['um', 'uh', 'like', 'you know', 'I mean', 'kind of', 'sort of', 'basically']
+        for word in filler_words:
+            text = re.sub(r'\b' + word + r'\b', '', text, flags=re.IGNORECASE)
+        
+        # Remove repeated words and phrases
+        text = re.sub(r'\b(\w+)( \1\b)+', r'\1', text)
+        
+        # Remove extra whitespace
+        text = ' '.join(text.split())
+        
+        return text
+
+    def post_process_summary(self, summary):
+        # Remove repeated sentences
+        sentences = summary.split('.')
+        unique_sentences = []
+        for sentence in sentences:
+            if sentence.strip() and sentence.strip() not in unique_sentences:
+                unique_sentences.append(sentence.strip())
+        
+        # Rejoin sentences
+        summary = '. '.join(unique_sentences)
+        
+        # Remove repeated phrases within sentences
+        words = summary.split()
+        unique_words = [x[0] for x in groupby(words)]
+        summary = ' '.join(unique_words)
+        
+        return summary
+
+    def extract_key_phrases(self, text):
+        # Using NLTK for key phrase extraction
+        words = nltk.word_tokenize(text)
+        tagged = nltk.pos_tag(words)
+        key_phrases = [word for word, tag in tagged if tag.startswith('NN') or tag.startswith('VB')]
+        return ' '.join(key_phrases)
+
+    def summarize_text(self, text, max_length=250):
+        cleaned_text = self.clean_text(text)
+        word_count = len(cleaned_text.split())
+        if word_count < self.summary_word_threshold:
+            return None  # We'll handle this case in create_segment
+
+        max_length = min(max_length, max(50, word_count // 2))
+
+        new_summary = self.summarizer(cleaned_text, max_length=max_length, min_length=min(50, max_length // 2), do_sample=False, num_beams=4)[0]['summary_text']
+        new_summary = self.post_process_summary(new_summary)
+
+        if not self.summary_history:
+            self.summary_history.append(new_summary)
+            return new_summary
+
+        vectorizer = TfidfVectorizer().fit_transform([new_summary] + self.summary_history)
+        cosine_similarities = cosine_similarity(vectorizer[0:1], vectorizer[1:]).flatten()
+
+        if any(sim > self.similarity_threshold for sim in cosine_similarities):
+            most_similar_index = cosine_similarities.argmax()
+            context = self.summary_history[most_similar_index]
+            combined_summary = f"{context} {new_summary}"
+            combined_summary = self.post_process_summary(combined_summary)
+            self.summary_history.append(combined_summary)
+            return combined_summary
+        else:
+            self.summary_history.append(new_summary)
+            return new_summary
+
 
 class StreamManager:
     def __init__(self):
@@ -35,7 +114,7 @@ class StreamManager:
         self.start_cleanup_thread()
         self.start_persistence_thread()
         
-        self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        self.summarizer = SmartSummarizer()  # Initialize SmartSummarizer instead of pipeline directly
         
         self.accumulated_transcript = ""
         self.word_threshold = 300
@@ -46,6 +125,12 @@ class StreamManager:
         self.summary_history = []
         self.max_summary_history = 3
         self.similarity_threshold = 0.3
+
+        self.audio_buffer = collections.deque(maxlen=40)  # 20 minutes of 30-second chunks
+        
+        self.accumulated_text_for_summary = ""
+        self.accumulated_word_count = 0
+        self.summary_word_threshold = 100  # Adjust this value as needed
 
     def add_stream(self, name, url):
         if name not in self.streams:
@@ -83,7 +168,7 @@ class StreamManager:
                 continue
 
     def handle_audio_chunk(self, name, audio_stream):
-        chunk_size = 16000 * 2 * 10
+        chunk_size = 16000 * 2 * 30  # 30 seconds of audio
         buffer = audio_stream.read(chunk_size)
 
         if not buffer:
@@ -115,7 +200,11 @@ class StreamManager:
                 logger.info(f"No text transcribed for {name}. Skipping summarization and topic segmentation.")
                 return
 
-            self.process_transcript(text, name)
+            with self.audio_lock:
+                self.audio_buffer.append((audio_segment, text))
+                self.accumulated_transcript += " " + text
+                self.accumulated_transcript = self.summarizer.clean_text(self.accumulated_transcript)
+                self.process_buffer(name)
 
             with self.audio_lock:
                 temp_copy = f'/tmp/{name}_{unique_id}_copy.wav'
@@ -132,73 +221,66 @@ class StreamManager:
             if os.path.exists(temp_audio_path):
                 os.remove(temp_audio_path)
 
-    def clean_text(self, text):
-        # Remove filler words and phrases
-        filler_words = ['um', 'uh', 'like', 'you know', 'I mean', 'kind of', 'sort of', 'basically']
-        for word in filler_words:
-            text = re.sub(r'\b' + word + r'\b', '', text, flags=re.IGNORECASE)
-        
-        # Remove repeated words and phrases
-        text = re.sub(r'\b(\w+)( \1\b)+', r'\1', text)
-        
-        # Remove extra whitespace
-        text = ' '.join(text.split())
-        
-        return text
+    def process_buffer(self, name):
+        while len(self.audio_buffer) >= 2:  # Process every minute (2 * 30-second chunks)
+            segment = self.create_segment(name)
+            if segment:
+                self.store_segment(segment)
 
-    def post_process_summary(self, summary):
-        # Remove repeated sentences
-        sentences = summary.split('.')
-        unique_sentences = []
-        for sentence in sentences:
-            if sentence.strip() and sentence.strip() not in unique_sentences:
-                unique_sentences.append(sentence.strip())
+    def create_segment(self, name):
+        audio = AudioSegment.empty()
+        text = ""
+        with self.audio_lock:
+            while self.audio_buffer:
+                chunk = self.audio_buffer.popleft()
+                audio += chunk[0]
+                text += chunk[1] + " "
         
-        # Rejoin sentences
-        summary = '. '.join(unique_sentences)
+        self.accumulated_text_for_summary += text
+        self.accumulated_word_count += len(text.split())
         
-        # Remove repeated phrases within sentences
-        words = summary.split()
-        unique_words = [x[0] for x in groupby(words)]
-        summary = ' '.join(unique_words)
+        summary = None
+        if self.accumulated_word_count >= self.summary_word_threshold:
+            summary = self.summarizer.summarize_text(self.accumulated_text_for_summary, max_length=250)
+            self.accumulated_text_for_summary = ""
+            self.accumulated_word_count = 0
         
-        return summary
-
-    def summarize_text(self, text, max_length=250):
-        cleaned_text = self.clean_text(text)
-        word_count = len(cleaned_text.split())
-        if word_count < self.word_threshold:
+        if summary:
+            return {
+                'station': name,
+                'audio': audio,
+                'text': text,
+                'summary': summary,
+                'timestamp': timezone.now()
+            }
+        else:
             return None
 
-        max_length = min(max_length, max(50, word_count // 2))
-
-        new_summary = self.summarizer(cleaned_text, max_length=max_length, min_length=min(50, max_length // 2), do_sample=False, num_beams=4)[0]['summary_text']
-        new_summary = self.post_process_summary(new_summary)
-
-        if not self.summary_history:
-            return new_summary
-
-        vectorizer = TfidfVectorizer().fit_transform([new_summary] + self.summary_history)
-        cosine_similarities = cosine_similarity(vectorizer[0:1], vectorizer[1:]).flatten()
-
-        if any(sim > self.similarity_threshold for sim in cosine_similarities):
-            most_similar_index = cosine_similarities.argmax()
-            context = self.summary_history[most_similar_index]
-            combined_summary = f"{context} {new_summary}"
-            return self.post_process_summary(combined_summary)
-        else:
-            return new_summary
+    def store_segment(self, segment):
+        if segment is None:
+            return
+        
+        audio_path = f"/tmp/{segment['station']}_{segment['timestamp'].strftime('%Y%m%d%H%M%S')}.wav"
+        segment['audio'].export(audio_path, format="wav")
+        Segment.objects.create(
+            station=RadioStation.objects.get(name=segment['station']),
+            timestamp=segment['timestamp'],
+            audio_path=audio_path,
+            text=segment['text'],
+            summary=segment['summary']
+        )
 
     def process_transcript(self, new_transcript, name):
-        self.accumulated_transcript += " " + new_transcript
-        self.accumulated_transcript = self.clean_text(self.accumulated_transcript)
+        with self.audio_lock:
+            self.accumulated_transcript += " " + new_transcript
+            self.accumulated_transcript = self.summarizer.clean_text(self.accumulated_transcript)
         
         word_count = len(self.accumulated_transcript.split())
         current_time = time.time()
         time_since_last_summary = current_time - self.last_summary_time
         
         if word_count >= self.word_threshold or time_since_last_summary >= self.time_threshold:
-            summary = self.summarize_text(self.accumulated_transcript, max_length=250)
+            summary = self.summarizer.summarize_text(self.accumulated_transcript, max_length=250)
             if summary:
                 logger.info(f"Summary for {name}: {summary}")
                 
@@ -231,7 +313,7 @@ class StreamManager:
                 else:
                     logger.error("Failed to acquire lock in process_transcript after 3 attempts")
             elif word_count >= self.max_accumulation_words:
-                summary = self.summarize_text(self.accumulated_transcript, max_length=300)
+                summary = self.summarizer.summarize_text(self.accumulated_transcript, max_length=300)
                 logger.info(f"Forced summary for {name}: {summary}")
                 self.accumulated_transcript = ""
                 self.last_summary_time = current_time
