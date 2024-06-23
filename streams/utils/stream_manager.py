@@ -7,18 +7,16 @@ from io import BytesIO
 import os
 import uuid
 import time
-import collections
-from datetime import datetime
 from collections import deque, defaultdict
 from streams.models import RadioStation, Transcription, Segment
 from transformers import pipeline
 import re
 import logging
 from queue import Queue
+from django.utils import timezone
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from itertools import groupby
-from django.utils import timezone
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -45,9 +43,9 @@ class StreamManager:
         self.summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
         
         self.accumulated_transcript = ""
-        self.word_threshold = 300
-        self.max_accumulation_words = 1000
-        self.time_threshold = 60  # 60 seconds
+        self.word_threshold = 400  # Moderately increased word threshold
+        self.max_accumulation_words = 2000
+        self.time_threshold = 180  # Moderately increased time threshold (3 minutes)
         self.last_summary_time = time.time()
         
         self.summary_history = []
@@ -56,7 +54,7 @@ class StreamManager:
 
         self.accumulated_text_for_summary = ""
         self.accumulated_word_count = 0
-        self.summary_word_threshold = 100  # Adjust this value as needed
+        self.summary_word_threshold = 250  # Adjusted summary word threshold
 
     def start_processing_threads(self):
         threading.Thread(target=self.process_transcriptions, daemon=True).start()
