@@ -8,6 +8,7 @@ import os
 import uuid
 import time
 import collections
+import queue
 from datetime import datetime
 from collections import defaultdict
 from streams.models import RadioStation, Transcription, Segment
@@ -20,7 +21,7 @@ from itertools import groupby
 from django.utils import timezone
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Set environment variable to handle tokenizer parallelism warning
@@ -36,53 +37,45 @@ class SmartSummarizer:
         self.summary_history = []
 
     def clean_text(self, text):
-        # Remove filler words and phrases
         filler_words = ['um', 'uh', 'like', 'you know', 'I mean', 'kind of', 'sort of', 'basically']
         for word in filler_words:
             text = re.sub(r'\b' + word + r'\b', '', text, flags=re.IGNORECASE)
         
-        # Remove repeated words and phrases
         text = re.sub(r'\b(\w+)( \1\b)+', r'\1', text)
-        
-        # Remove extra whitespace
         text = ' '.join(text.split())
         
         return text
 
     def post_process_summary(self, summary):
-        # Remove repeated sentences
         sentences = summary.split('.')
         unique_sentences = []
         for sentence in sentences:
             if sentence.strip() and sentence.strip() not in unique_sentences:
                 unique_sentences.append(sentence.strip())
         
-        # Rejoin sentences
         summary = '. '.join(unique_sentences)
-        
-        # Remove repeated phrases within sentences
         words = summary.split()
         unique_words = [x[0] for x in groupby(words)]
         summary = ' '.join(unique_words)
         
         return summary
 
-    def extract_key_phrases(self, text):
-        # Using NLTK for key phrase extraction
-        words = nltk.word_tokenize(text)
-        tagged = nltk.pos_tag(words)
-        key_phrases = [word for word, tag in tagged if tag.startswith('NN') or tag.startswith('VB')]
-        return ' '.join(key_phrases)
-
     def summarize_text(self, text, max_length=250):
         cleaned_text = self.clean_text(text)
         word_count = len(cleaned_text.split())
         if word_count < self.summary_word_threshold:
-            return None  # We'll handle this case in create_segment
+            return None
 
         max_length = min(max_length, max(50, word_count // 2))
 
-        new_summary = self.summarizer(cleaned_text, max_length=max_length, min_length=min(50, max_length // 2), do_sample=False, num_beams=4)[0]['summary_text']
+        try:
+            logger.debug("Starting summarization in SmartSummarizer")
+            new_summary = self.summarizer(cleaned_text, max_length=max_length, min_length=min(50, max_length // 2), do_sample=False, num_beams=4)[0]['summary_text']
+            logger.debug(f"Summarization complete: {new_summary}")
+        except Exception as e:
+            logger.error(f"Error during summarization: {e}", exc_info=True)
+            return None
+
         new_summary = self.post_process_summary(new_summary)
 
         if not self.summary_history:
@@ -107,14 +100,13 @@ class SmartSummarizer:
 class StreamManager:
     def __init__(self):
         self.streams = {}
-        self.transcription_cache = defaultdict(list)
-        self.audio_lock = threading.Lock()
+        self.transcription_queue = queue.Queue()
+        self.summarization_queue = queue.Queue()
         self.db_lock = threading.Lock()
         self.cleanup_interval = 300  # 5 minutes
         self.start_cleanup_thread()
-        self.start_persistence_thread()
         
-        self.summarizer = SmartSummarizer()  # Initialize SmartSummarizer instead of pipeline directly
+        self.summarizer = SmartSummarizer()
         
         self.accumulated_transcript = ""
         self.word_threshold = 300
@@ -130,12 +122,19 @@ class StreamManager:
         
         self.accumulated_text_for_summary = ""
         self.accumulated_word_count = 0
-        self.summary_word_threshold = 100  # Adjust this value as needed
+        self.summary_word_threshold = 100
+
+        self.start_worker_threads()
+
+    def start_worker_threads(self):
+        threading.Thread(target=self.process_transcriptions, daemon=True).start()
+        threading.Thread(target=self.process_summaries, daemon=True).start()
 
     def add_stream(self, name, url):
         if name not in self.streams:
             logger.info(f"Starting stream for {name}")
             stream_thread = threading.Thread(target=self.process_stream, args=(name, url))
+            stream_thread.daemon = True  # Ensure threads close with main program
             stream_thread.start()
             self.streams[name] = stream_thread
 
@@ -172,6 +171,7 @@ class StreamManager:
         buffer = audio_stream.read(chunk_size)
 
         if not buffer:
+            logger.warning("Empty buffer, returning from handle_audio_chunk")
             return
 
         logger.info(f"Buffer size: {len(buffer)}")
@@ -200,16 +200,11 @@ class StreamManager:
                 logger.info(f"No text transcribed for {name}. Skipping summarization and topic segmentation.")
                 return
 
-            with self.audio_lock:
-                self.audio_buffer.append((audio_segment, text))
-                self.accumulated_transcript += " " + text
-                self.accumulated_transcript = self.summarizer.clean_text(self.accumulated_transcript)
-                self.process_buffer(name)
+            self.transcription_queue.put((audio_segment, text, name))
 
-            with self.audio_lock:
-                temp_copy = f'/tmp/{name}_{unique_id}_copy.wav'
-                os.rename(temp_audio_path, temp_copy)
-                logger.info(f"Saved a copy of the audio file to {temp_copy}")
+            temp_copy = f'/tmp/{name}_{unique_id}_copy.wav'
+            os.rename(temp_audio_path, temp_copy)
+            logger.info(f"Saved a copy of the audio file to {temp_copy}")
 
         except sr.UnknownValueError:
             logger.warning(f"Could not understand audio from {name}")
@@ -221,124 +216,105 @@ class StreamManager:
             if os.path.exists(temp_audio_path):
                 os.remove(temp_audio_path)
 
+    def process_transcriptions(self):
+        while True:
+            audio_segment, text, name = self.transcription_queue.get()
+            self.audio_buffer.append((audio_segment, text))
+            self.accumulated_transcript += " " + text
+            self.accumulated_transcript = self.summarizer.clean_text(self.accumulated_transcript)
+            logger.debug(f"Accumulated transcript: {self.accumulated_transcript}")
+            self.process_buffer(name)
+            self.transcription_queue.task_done()
+
     def process_buffer(self, name):
-        while len(self.audio_buffer) >= 2:  # Process every minute (2 * 30-second chunks)
+        logger.debug("Entering process_buffer")
+        if len(self.audio_buffer) >= 2:  # Process every minute (2 * 30-second chunks)
+            self.summarization_queue.put(name)
+        logger.debug("Exiting process_buffer")
+
+    def process_summaries(self):
+        while True:
+            name = self.summarization_queue.get()
             segment = self.create_segment(name)
             if segment:
                 self.store_segment(segment)
+            self.summarization_queue.task_done()
 
     def create_segment(self, name):
+        logger.debug("Entering create_segment")
         audio = AudioSegment.empty()
         text = ""
-        with self.audio_lock:
-            while self.audio_buffer:
-                chunk = self.audio_buffer.popleft()
-                audio += chunk[0]
-                text += chunk[1] + " "
         
+        while self.audio_buffer:
+            chunk = self.audio_buffer.popleft()
+            audio += chunk[0]
+            text += chunk[1] + " "
+            logger.debug(f"Processed chunk: {chunk[1][:50]}...")  # Log the first 50 characters of each chunk
+
         self.accumulated_text_for_summary += text
         self.accumulated_word_count += len(text.split())
-        
+        logger.debug(f"Accumulated text for summary: {self.accumulated_text_for_summary[:100]}...")  # Log the first 100 characters
+        logger.debug(f"Accumulated word count: {self.accumulated_word_count}")
+
         summary = None
         if self.accumulated_word_count >= self.summary_word_threshold:
-            summary = self.summarizer.summarize_text(self.accumulated_text_for_summary, max_length=250)
-            self.accumulated_text_for_summary = ""
-            self.accumulated_word_count = 0
-        
+            try:
+                logger.debug("Starting summarization process")
+                start_time = time.time()
+                summary = self.summarizer.summarize_text(self.accumulated_text_for_summary, max_length=250)
+                end_time = time.time()
+                self.accumulated_text_for_summary = ""
+                self.accumulated_word_count = 0
+                logger.debug(f"Generated summary: {summary} in {end_time - start_time} seconds")
+            except Exception as e:
+                logger.error(f"Error generating summary: {e}", exc_info=True)
+                summary = None
+
+        logger.debug("Exiting create_segment")
         if summary:
-            return {
+            segment = {
                 'station': name,
                 'audio': audio,
                 'text': text,
                 'summary': summary,
                 'timestamp': timezone.now()
             }
+            logger.debug(f"Created segment: {segment}")
+            return segment
         else:
+            logger.debug("No summary generated, returning None")
             return None
 
     def store_segment(self, segment):
+        logger.debug("Entering store_segment")
         if segment is None:
+            logger.debug("Segment is None, exiting store_segment")
             return
         
         audio_path = f"/tmp/{segment['station']}_{segment['timestamp'].strftime('%Y%m%d%H%M%S')}.wav"
-        segment['audio'].export(audio_path, format="wav")
-        Segment.objects.create(
-            station=RadioStation.objects.get(name=segment['station']),
-            timestamp=segment['timestamp'],
-            audio_path=audio_path,
-            text=segment['text'],
-            summary=segment['summary']
-        )
-
-    def process_transcript(self, new_transcript, name):
-        with self.audio_lock:
-            self.accumulated_transcript += " " + new_transcript
-            self.accumulated_transcript = self.summarizer.clean_text(self.accumulated_transcript)
-        
-        word_count = len(self.accumulated_transcript.split())
-        current_time = time.time()
-        time_since_last_summary = current_time - self.last_summary_time
-        
-        if word_count >= self.word_threshold or time_since_last_summary >= self.time_threshold:
-            summary = self.summarizer.summarize_text(self.accumulated_transcript, max_length=250)
-            if summary:
-                logger.info(f"Summary for {name}: {summary}")
-                
-                self.summary_history.append(summary)
-                if len(self.summary_history) > self.max_summary_history:
-                    self.summary_history.pop(0)
-                
-                words_to_keep = min(word_count // 2, self.max_accumulation_words // 2)
-                self.accumulated_transcript = " ".join(self.accumulated_transcript.split()[-words_to_keep:])
-                
-                self.last_summary_time = current_time
-                
-                for attempt in range(3):
-                    if self.db_lock.acquire(timeout=5):
-                        try:
-                            Transcription.objects.create(
-                                station=RadioStation.objects.get(name=name),
-                                text=new_transcript,
-                                summary=summary
-                            )
-                            self.transcription_cache[name].append(new_transcript)
-                            if len(self.transcription_cache[name]) > 10:
-                                self.transcription_cache[name].pop(0)
-                            break
-                        finally:
-                            self.db_lock.release()
-                    else:
-                        logger.warning(f"Failed to acquire lock in process_transcript (attempt {attempt + 1})")
-                        time.sleep(1)
-                else:
-                    logger.error("Failed to acquire lock in process_transcript after 3 attempts")
-            elif word_count >= self.max_accumulation_words:
-                summary = self.summarizer.summarize_text(self.accumulated_transcript, max_length=300)
-                logger.info(f"Forced summary for {name}: {summary}")
-                self.accumulated_transcript = ""
-                self.last_summary_time = current_time
+        try:
+            segment['audio'].export(audio_path, format="wav")
+            if self.db_lock.acquire(timeout=5):  # Added timeout to acquire lock
+                try:
+                    Segment.objects.create(
+                        station=RadioStation.objects.get(name=segment['station']),
+                        timestamp=segment['timestamp'],
+                        audio_path=audio_path,
+                        text=segment['text'],
+                        summary=segment['summary']
+                    )
+                finally:
+                    self.db_lock.release()
+            else:
+                logger.warning("Failed to acquire db lock in store_segment")
+        except Exception as e:
+            logger.error(f"Error storing segment: {e}", exc_info=True)
+        logger.debug("Exiting store_segment")
 
     def start_cleanup_thread(self):
         cleanup_thread = threading.Thread(target=self.cleanup_temp_files_periodically)
         cleanup_thread.daemon = True
         cleanup_thread.start()
-
-    def start_persistence_thread(self):
-        persistence_thread = threading.Thread(target=self.persist_data)
-        persistence_thread.daemon = True
-        persistence_thread.start()
-
-    def persist_data(self):
-        while True:
-            if self.db_lock.acquire(timeout=10):
-                try:
-                    # Code to persist data to the database or file
-                    pass
-                finally:
-                    self.db_lock.release()
-            else:
-                logger.warning("Failed to acquire lock in persist_data")
-            time.sleep(self.cleanup_interval)
 
     def cleanup_temp_files_periodically(self):
         while True:
@@ -347,23 +323,20 @@ class StreamManager:
 
     def cleanup_tmp_files(self):
         logger.info("Starting cleanup process...")
-        if self.audio_lock.acquire(timeout=10):
-            try:
-                tmp_files = [f for f in os.listdir('/tmp') if f.endswith('_copy.wav')]
-                if not tmp_files:
-                    logger.info("No files to clean up.")
-                    return
-                for file in tmp_files:
-                    file_path = os.path.join('/tmp', file)
-                    try:
-                        os.remove(file_path)
-                        logger.info(f"Deleted temporary file: {file_path}")
-                    except Exception as e:
-                        logger.error(f"Error deleting file {file_path}: {e}")
-            finally:
-                self.audio_lock.release()
-        else:
-            logger.warning("Failed to acquire lock in cleanup_tmp_files")
+        try:
+            tmp_files = [f for f in os.listdir('/tmp') if f.endswith('_copy.wav')]
+            if not tmp_files:
+                logger.info("No files to clean up.")
+                return
+            for file in tmp_files:
+                file_path = os.path.join('/tmp', file)
+                try:
+                    os.remove(file_path)
+                    logger.info(f"Deleted temporary file: {file_path}")
+                except Exception as e:
+                    logger.error(f"Error deleting file {file_path}: {e}")
+        except Exception as e:
+            logger.error(f"Error in cleanup_tmp_files: {e}")
         logger.info("Cleanup process completed.")
 
 if __name__ == "__main__":
