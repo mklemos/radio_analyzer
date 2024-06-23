@@ -1,6 +1,3 @@
-Sure, here's a comprehensive README for your project:
-
----
 
 # Radio Analyzer
 
