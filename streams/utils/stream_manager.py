@@ -56,6 +56,9 @@ class StreamManager:
         self.accumulated_word_count = 0
         self.summary_word_threshold = 250  # Adjusted summary word threshold
 
+        self.chunk_overlap = 5  # Increased overlap to 10 seconds
+        self.next_overlap_segment = None
+
     def start_processing_threads(self):
         threading.Thread(target=self.process_transcriptions, daemon=True).start()
         threading.Thread(target=self.process_summaries, daemon=True).start()
@@ -114,6 +117,14 @@ class StreamManager:
         try:
             audio_segment = AudioSegment.from_file(BytesIO(buffer), format='wav')
             audio_segment = normalize(audio_segment)
+
+            # Add the previous overlap segment if it exists
+            if self.next_overlap_segment:
+                audio_segment = self.next_overlap_segment + audio_segment
+
+            # Save the last 10 seconds of the current chunk for overlap
+            overlap_segment = audio_segment[-self.chunk_overlap * 1000:]
+
             audio_segment.export(temp_audio_path, format='wav')
 
             recognizer = sr.Recognizer()
@@ -135,6 +146,9 @@ class StreamManager:
                 temp_copy = f'/tmp/{name}_{unique_id}_copy.wav'
                 os.rename(temp_audio_path, temp_copy)
                 logger.info(f"Saved a copy of the audio file to {temp_copy}")
+
+            # Set the overlap segment for the next chunk
+            self.next_overlap_segment = overlap_segment
 
         except sr.UnknownValueError:
             logger.warning(f"Could not understand audio from {name}")
